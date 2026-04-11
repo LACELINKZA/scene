@@ -1,97 +1,136 @@
-import * as SecureStore from 'expo-secure-store';
-import { fetch as expoFetch } from 'expo/fetch';
-
 const originalFetch = fetch;
-const authKey = `${process.env.EXPO_PUBLIC_PROJECT_GROUP_ID}-jwt`;
+const isBackend = () => typeof window === 'undefined';
 
-const getURLFromArgs = (...args: Parameters<typeof fetch>) => {
-  const [urlArg] = args;
-  let url: string | null;
-  if (typeof urlArg === 'string') {
-    url = urlArg;
-  } else if (typeof urlArg === 'object' && urlArg !== null) {
-    url = urlArg.url;
-  } else {
-    url = null;
+const safeStringify = (value: unknown) =>
+  JSON.stringify(value, (_k, v) => {
+    if (v instanceof Date) return { __t: 'Date', v: v.toISOString() };
+    if (v instanceof Error)
+      return { __t: 'Error', v: { name: v.name, message: v.message, stack: v.stack } };
+    return v;
+  });
+
+const postToParent = (level: string, text: string, extra: unknown) => {
+  try {
+    if (isBackend() || !window.parent || window.parent === window) {
+      ('level' in console ? console[level] : console.log)(text, extra);
+      return;
+    }
+    window.parent.postMessage(
+      {
+        type: 'sandbox:web:console-write',
+        __viteConsole: true,
+        level,
+        text,
+        args: [safeStringify(extra)],
+      },
+      '*'
+    );
+  } catch {
+    /* noop */
   }
-  return url;
 };
 
-const isFileURL = (url: string) => {
-  return url.startsWith('file://') || url.startsWith('data:');
+const getUrlFromArgs = (...args: Parameters<typeof originalFetch>): string => {
+  const [input] = args;
+  if (typeof input === 'string') return input;
+  if (input instanceof Request) return input.url;
+  return `${input.protocol}//${input.host}${input.pathname}`;
 };
 
 const isFirstPartyURL = (url: string) => {
+  return url.startsWith('/integrations') || url.startsWith('/_create');
+};
+
+const isSecondPartyUrl = (url: string) => {
   return (
-    url.startsWith('/') ||
-    (process.env.EXPO_PUBLIC_BASE_URL && url.startsWith(process.env.EXPO_PUBLIC_BASE_URL))
+    (process.env.NEXT_PUBLIC_CREATE_API_BASE_URL &&
+      url.startsWith(process.env.NEXT_PUBLIC_CREATE_API_BASE_URL)) ||
+    (process.env.NEXT_PUBLIC_CREATE_BASE_URL &&
+      url.startsWith(process.env.NEXT_PUBLIC_CREATE_BASE_URL)) ||
+    url.startsWith('https://www.create.xyz') ||
+    url.startsWith('https://api.create.xyz/') ||
+    url.startsWith('https://www.createanything.com') ||
+    url.startsWith('https://api.createanything.com')
   );
 };
 
-const isSecondPartyURL = (url: string) => {
-  return url.startsWith('/_create/');
-};
+export const fetchWithHeaders = async (
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> => {
+  const url = getUrlFromArgs(input, init);
 
-type Params = Parameters<typeof expoFetch>;
-const fetchToWeb = async function fetchWithHeaders(...args: Params) {
-  const firstPartyURL = process.env.EXPO_PUBLIC_BASE_URL;
-  const secondPartyURL = process.env.EXPO_PUBLIC_PROXY_BASE_URL;
-  const [input, init] = args;
-  const url = getURLFromArgs(input, init);
-  if (!url) {
-    return expoFetch(input, init);
-  }
+  const additionalHeaders = {
+    'x-createxyz-project-group-id': process.env.NEXT_PUBLIC_PROJECT_GROUP_ID,
+  };
 
-  if (isFileURL(url)) {
+  const isExternalFetch = !isFirstPartyURL(url) && !isSecondPartyUrl(url);
+  // we should not add headers to requests that don't go to our own server
+  // or if it's an API request
+  if (isExternalFetch || url.startsWith('/api')) {
     return originalFetch(input, init);
   }
 
-  const isExternalFetch = !isFirstPartyURL(url);
-  // we should not add headers to requests that don't go to our own server
-  if (isExternalFetch) {
-    return expoFetch(input, init);
-  }
-
-  let finalInput = input;
-  const baseURL = isSecondPartyURL(url) ? secondPartyURL : firstPartyURL;
-  if (typeof input === 'string') {
-    finalInput = input.startsWith('/') ? `${baseURL}${input}` : input;
+  // Normalize Request into init
+  let finalInit: RequestInit;
+  if (input instanceof Request) {
+    const hasBody = !!input.body;
+    finalInit = {
+      method: input.method,
+      headers: new Headers(input.headers),
+      body: input.body,
+      mode: input.mode,
+      credentials: input.credentials,
+      cache: input.cache,
+      redirect: input.redirect,
+      referrer: input.referrer,
+      referrerPolicy: input.referrerPolicy,
+      integrity: input.integrity,
+      keepalive: input.keepalive,
+      signal: input.signal,
+      ...(hasBody ? { duplex: 'half' } : {}),
+      ...init,
+    };
   } else {
-    return expoFetch(input, init);
+    finalInit = { ...init, headers: new Headers(init?.headers ?? {}) };
   }
 
-  const initHeaders = init?.headers ?? {};
-  const finalHeaders = new Headers(initHeaders);
+  const finalHeaders = new Headers(finalInit.headers);
+  for (const [key, value] of Object.entries(additionalHeaders)) {
+    if (value) finalHeaders.set(key, value);
+  }
+  finalInit.headers = finalHeaders;
 
-  const headers = {
-    'x-createxyz-project-group-id': process.env.EXPO_PUBLIC_PROJECT_GROUP_ID,
-    host: process.env.EXPO_PUBLIC_HOST,
-    'x-forwarded-host': process.env.EXPO_PUBLIC_HOST,
-    'x-createxyz-host': process.env.EXPO_PUBLIC_HOST,
-  };
+  const prefix = !isSecondPartyUrl(url)
+    ? isBackend()
+      ? (process.env.NEXT_PUBLIC_CREATE_BASE_URL ?? 'https://www.create.xyz')
+      : ''
+    : '';
 
-  for (const [key, value] of Object.entries(headers)) {
-    if (value) {
-      finalHeaders.set(key, value);
+  try {
+    const result = await originalFetch(`${prefix}${url}`, finalInit);
+    if (!result.ok) {
+      postToParent(
+        'error',
+        `Failed to load resource: the server responded with a status of ${result.status} (${result.statusText ?? ''})`,
+        {
+          url,
+          status: result.status,
+          statusText: result.statusText,
+        }
+      );
     }
-  }
-
-  const auth = await SecureStore.getItemAsync(authKey)
-    .then((auth) => {
-      return auth ? JSON.parse(auth) : null;
-    })
-    .catch(() => {
-      return null;
+    return result;
+  } catch (error) {
+    postToParent('error', 'Fetch error', {
+      url,
+      error:
+        error instanceof Error
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : error,
     });
-
-  if (auth) {
-    finalHeaders.set('authorization', `Bearer ${auth.jwt}`);
+    throw error;
   }
-
-  return expoFetch(finalInput, {
-    ...init,
-    headers: finalHeaders,
-  });
 };
 
-export default fetchToWeb;
+export default fetchWithHeaders;
